@@ -1,5 +1,5 @@
 # Pade-disk-code
-Code to simulate protoplanetary disk turbulence using Pade/compact differencing.
+Fortran90 code to simulate protoplanetary disk turbulence using Pade/compact differencing.
 
 To untar the distribution type:
 
