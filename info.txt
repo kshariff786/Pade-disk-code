@@ -1,0 +1,23 @@
+ nr =  512 nz =  512 nphi =    1
+ mpi run with num_nodes =     4
+ cpu layout: ng1 =    4 ng2 =    1
+Computed min_grid_size for axisymmetric case
+  In subroutine set_up_thermal_parameters:
+  isothermal =  T
+  ibalanced =            1
+ rmin_BC = 10
+ rmax_BC = 10
+ zmin_BC = 10
+ zmax_BC = 10
+ Codes are:             
+ null                 =  0
+ non_reflective       =  1
+ zero_normal_momentum =  2
+ Cassen-Moosman       =  3
+ periodic             =  6
+ viscous_wall         =  7
+ In activate_pade_filter eps_or_tau = eps eps_filter =  0.10000E-01 tau_filter =  0.50000E-01
+ density is negative at sub-step = 3
+ ir =    2 iz =    2 iphi =    1
+ density is negative at sub-step = 3
+ ir =    2 iz =  511 iphi =    1

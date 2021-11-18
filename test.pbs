@@ -1,0 +1,9 @@
+set return_code = `cat return_status.dat`
+set save_file   = `cat return_status.dat`
+echo $return_code
+echo $save_file
+
+if ($return_code == 0) then
+   mv save_file = mpi_restart
+#qsub disk.pbs
+endif

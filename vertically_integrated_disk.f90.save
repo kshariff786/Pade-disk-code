@@ -1,0 +1,366 @@
+!----------------------------------------------------------------------------------85
+
+subroutine vertically_integrated_disk  ! vid for short
+
+use dof_indices
+use grid, only: ndof, nz, nr, nphi, rmin, rmax, zmin, zmax, zgrid, rgrid, &
+     Ji_z, Ji_r, phi_max
+use boundary_conditions
+use thermal_parameters, only: ci_squared_initial, gm1
+use gravity, only: gz
+use q_array, only: q
+use transposes_of_q_and_qdot
+use logical_units
+use control_parameters, only: n_words_allocated, restart_file, save_file
+use math_constants, only: pi
+use partition_data
+use cpu_timing
+#ifdef mpi_code
+   use mpi
+#endif
+implicit none
+
+integer :: istep, istep_of_restart_file, nsteps, istep1
+real(8) :: t, cfl, dt, dt_previous
+
+! Things set to unity:
+real(8) :: T_orbital0, r0, Sigma0, Omega0
+
+! Temps:
+real(8) :: V_Kep0, uphi2, ci0
+
+! Exponents:
+real(8) :: q_Sigma, q_T, q_ci
+
+! The only free parameter beside the exponents:
+real(8) :: Keplerian_Mach
+
+! For passing to subroutine initialize thermal set-up:
+real(8) :: gamma = 1.4d0 ! Not really needed since we are isothermal.
+logical :: isothermal = .true.
+
+! For passing to subroutine initialize for gravity set-up
+real(8) :: GM
+integer :: gravity_flag, i_thin, i_no_radial
+
+! Field smoothing
+real(8) :: eps_smooth, eps_smooth_non_periodic, eps_smooth_periodic
+
+integer :: iz, ir, iphi, ier
+integer :: tecplot_interval, profiles_interval, save_interval, smoothing_interval
+
+! Functions of r:
+real(8), allocatable, dimension(:) :: Sigma, uK, ci, Pbar
+
+! Used to satisfy numerical radial balance:
+real(8), allocatable, dimension(:) :: dPdr
+
+logical :: apply_fargo_trick, integer_shifts, apply_fargo_correction
+
+logical :: restart, perturb, plot_perturbation_field, &
+     suppress_z_derivatives_when_nz_not_1, &
+     use_supplied_dt = .false. ! default
+
+namelist /vid_input/ restart, nr, nphi, nz, cfl, nsteps, tecplot_interval, &
+     eps_smooth, smoothing_interval, apply_fargo_trick, integer_shifts, &
+     apply_fargo_correction, use_supplied_dt, dt
+
+if (my_node .eq. 0) print *, ' Running vertically_integrated_disk'
+
+! Read namelist input:
+if (my_node .eq. 0) then
+   print *, ' node 0: about to open and read namelist file for VID'      
+   open (unit = lun_general_purpose, file = 'input_file', form = 'formatted', &
+        status = 'old')
+   read (lun_general_purpose, nml = vid_input)
+   close (lun_general_purpose)
+
+   print *, ' node 0: read namelist input file'
+   print *, ' node 0: nr = ', nr, ' nphi = ', nphi
+end if
+
+#ifdef mpi_code
+   call mpi_bcast(restart,                1, mpi_logical, 0, mpi_comm_world, ier)
+   call mpi_bcast(nr,                     1, mpi_integer, 0, mpi_comm_world, ier)
+   call mpi_bcast(nphi,                   1, mpi_integer, 0, mpi_comm_world, ier)
+   call mpi_bcast(nz,                     1, mpi_integer, 0, mpi_comm_world, ier)
+   call mpi_bcast(cfl,                    1, mpi_double,  0, mpi_comm_world, ier)
+   call mpi_bcast(nsteps,                 1, mpi_integer, 0, mpi_comm_world, ier)
+   call mpi_bcast(tecplot_interval,       1, mpi_integer, 0, mpi_comm_world, ier)
+   call mpi_bcast(eps_smooth,             1, mpi_double,  0, mpi_comm_world, ier)
+   call mpi_bcast(smoothing_interval,     1, mpi_integer, 0, mpi_comm_world, ier)
+   call mpi_bcast(apply_fargo_trick,      1, mpi_logical,  0, mpi_comm_world, ier)
+   call mpi_bcast(integer_shifts,         1, mpi_logical,  0, mpi_comm_world, ier)   
+   call mpi_bcast(apply_fargo_correction, 1, mpi_logical,  0, mpi_comm_world, ier)   
+   call mpi_bcast(use_supplied_dt,        1, mpi_logical,  0, mpi_comm_world, ier)
+   call mpi_bcast(dt,                     1, mpi_double,  0, mpi_comm_world, ier)   
+#endif
+   
+if (my_node .eq. 0) print *, ' node 0: eps_smooth = ', eps_smooth
+
+! Trick to get a parallel partitioning for an (r, phi) grid.
+#ifdef mpi_code
+   nz = 2  ! arrays will be artificially dimensioned larger and some work will be twice.
+   suppress_z_derivatives_when_nz_not_1 = .true.
+   zmin = 0.0
+   zmax = 1.0
+#else
+   nz = 1
+   suppress_z_derivatives_when_nz_not_1 = .true.  ! doesn't matter what we set this since nz = 1
+   zmin = 0.0
+   zmax = 0.0
+#endif
+   
+! We can set three things to unity:
+T_orbital0   = 1.0d0
+r0           = 1.0d0
+Sigma0       = 1.0d0 ! Surface density
+
+! The vertically integrated equations (so-called) look the same as the
+! non-integrated ones with the identification:
+! rho ---> Sigma
+! p   ---> P_bar, vertically integrated pressure
+! Hence in the coding below (and in the rest of the code) we sometimes
+! use the notation on the left.
+
+! Consequence of above:
+Omega0 = 2.d0 * pi / T_orbital0
+GM     = Omega0**2 * r0**3
+V_Kep0 = SQRT(GM/r0)
+
+! Gravity set-up parameters:
+gravity_flag = 1
+i_thin       = 0
+i_no_radial  = 0
+
+! Exponents:
+q_Sigma = -1.5d0  ! for surface density
+q_T     = -0.5d0  ! for temperature or equivalently c_i^2
+q_ci    = q_T * 0.5d0 ! for the isothermal sound-speed
+
+! This is a parameter:
+Keplerian_Mach = 30.d0
+
+! Therefore:
+ci0 = V_Kep0/Keplerian_Mach
+
+isothermal = .true.
+
+! Domain
+rmin   = 0.5d0
+rmax   = 1.5d0
+phi_max = 2.d0 * pi
+
+z_BC = zero_normal_momentum
+r_BC = zero_normal_momentum
+
+! This also reads the restart file if necessary:
+call initialize(restart, istep_of_restart_file, t, gamma, isothermal, gravity_flag, &
+     i_thin, i_no_radial, GM, apply_fargo_trick, integer_shifts, apply_fargo_correction, &
+     suppress_z_derivatives_when_nz_not_1)
+
+allocate(Sigma(nr), uK(nr), ci(nr), Pbar(nr), dPdr(nr))
+
+! Functions of r for the basic state:
+do ir = 1, nr
+   Sigma(ir) = Sigma0 * (rgrid(ir) / r0)**q_Sigma
+   uK(ir)    = SQRT(GM/rgrid(ir))
+   ci(ir)    = ci0 * (rgrid(ir)/r0)**q_ci
+   ! Vertically integrated pressure from isothermal EOS:
+   Pbar(ir) = Sigma(ir) * ci(ir)**2
+end do
+
+call pade_diff_bundle(1, nr, Ji_r, Pbar, dPdr)
+
+! Initial condition:
+if (.not. restart) then
+   do iz = 1, nz
+      do iphi = sphi, ephi
+         do ir = sr, er
+            q(ir, iphi, iz, irho) = Sigma(ir)
+            ! Satisfy radial balance:
+            uphi2 = uK(ir)**2 + rgrid(ir)/Sigma(ir) * dPdr(ir) 
+            q(ir, iphi, iz, amom) = Sigma(ir) * SQRT(uphi2) * rgrid(ir)
+            !q(ir, iphi, iz, amom) = 0.0d0 ! For testing pure vortex field
+            q(ir, iphi, iz, rmom) = 0.0d0
+            q(ir, iphi, iz, zmom) = 0.0d0
+
+            ! Set energy in case we run adiabatically:
+            q(ir, iphi, iz, ener) = Pbar(ir)/gm1 + 0.5d0*q(ir,iphi,iz,irho)*uphi2            
+         end do
+      end do
+   end do
+
+   call store_basic_state
+   call add_vortex (GM)
+end if ! .not. restart
+
+! Needed for the isothermal option.  ci_squared_initial sits in
+! module thermal_parameters.
+if (isothermal) then
+   do iz = 1, nz
+      do ir = 1, nr
+         ci_squared_initial(ir, iz) = ci(ir)**2
+      end do
+   end do
+end if
+
+! These arrays are not needed anymore:
+deallocate(Pbar)
+
+if (.not. restart) then
+   istep1 = 1
+   t      = 0.0d0
+else
+   istep1 = istep_of_restart_file + 1
+end if
+
+call tecplot_horizontal_plane (q, 1, T_orbital0, t)
+plot_perturbation_field = .true.
+call tecplot_vorticity(q, t, plot_perturbation_field)
+
+call sanity_check
+
+if (my_node .eq. 0) print *, ' node 0: Mb allocated = ', float(8*n_words_allocated)/1.d6
+
+eps_smooth_non_periodic = eps_smooth
+eps_smooth_periodic     = eps_smooth
+
+cpu_time_for_rk4 = 0.0d0
+
+do istep = istep1, istep1 + nsteps - 1
+   ! call rk4(q, cfl, t, dt, use_supplied_dt)
+   call euler(q, cfl, t, dt, use_supplied_dt)
+   if (my_node .eq. 0) print *, ' node 0: finished istep = ', istep, ' t = ', t
+
+   if (mod(istep, smoothing_interval) .eq. 0) then
+      call smooth_field (eps_smooth_non_periodic, eps_smooth_periodic)
+   end if
+   
+   if (mod(istep, tecplot_interval ) .eq. 0) then
+      call tecplot_horizontal_plane (q, 1, T_orbital0, t)
+      call tecplot_vorticity(q, t, plot_perturbation_field)
+   end if
+
+   ! Detect blowing-up:
+   if (istep .gt. 1) then
+      if (dt .lt. dt_previous/20.d0) then
+         print *, ' dt decreased more than a factor of 20'
+         print *, ' dt          = ', dt
+         print *, ' dt_previous = ', dt_previous
+         go to 100 ! terminate
+      end if
+   end if
+   dt_previous = dt
+end do
+
+100 continue
+! Need the minus 1 since a fortran do loop increments the counter at the end.
+call finalize (istep-1, t)
+
+print *, ' average rk4 time per step = ', cpu_time_for_rk4/nsteps
+
+end subroutine vertically_integrated_disk
+
+!----------------------------------------------------------------------------------85
+
+subroutine add_vortex (GM)
+
+use grid
+use dof_indices
+use q_array
+use math_constants, only: pi
+use partition_data
+implicit none
+real(8) :: GM
+
+integer :: iz, iphi, ir
+real(8) :: x, y, xcen, ycen, dx, dy, s, theta, u_theta, arg, ux, uy, r, phi, &
+     peak_vorticity, Keplerian_vorticity, rmid, Gamma, core_radius, Sigma, ur, &
+     uphi
+real(8) :: s_max, s_cut_off, lambda, kr, func ! debug
+
+rmid = 0.5d0 * (rmin + rmax)
+Keplerian_vorticity = -0.5d0 * SQRT(GM / rmid**3)
+if (my_node .eq. 0) print *, ' Keplerian vorticity at rmid = ', Keplerian_vorticity
+
+! Desired peak vorticity of the vortex:
+peak_vorticity = -0.10d0 * Keplerian_vorticity
+if (my_node .eq. 0) print *, ' peak vorticity of vortex = ', peak_vorticity
+
+! Vortex center:
+xcen = rmid
+ycen = 0.0d0
+
+! Parameters for 1/4 cosine cut-off to ensure zero perturbation at the
+! boundaries:
+s_max = 0.8d0*(rmax - rmid)
+s_cut_off   = 0.50d0*s_max
+lambda      = 4.0d0*(s_max - s_cut_off)
+kr          = 2.d0*pi/lambda
+
+! Desired core radius:
+core_radius = 0.40d0 * s_max
+
+! Resulting vortex circulation:
+Gamma = peak_vorticity * pi * core_radius**2
+
+print *, ' s_max = ', s_max
+
+do iz = 1, nz
+   do iphi = sphi, ephi
+      do ir = sr, er
+         r   = rgrid(ir)
+         phi = phi_grid(iphi)
+         x = r * cos(phi)
+         y = r * sin(phi)
+         dx = x - xcen
+         dy = y - ycen
+
+         ! Polar coordinates of point relative to vortex center:
+         s = SQRT(dx**2 + dy**2)
+         theta = ATAN2(dy, dx)
+
+         arg = -s**2/core_radius**2
+         u_theta = Gamma / (2.d0*pi*s) * (1.d0 - exp(arg))
+
+         if (s .lt. s_cut_off) then
+            u_theta = u_theta
+            ! print *, ' s<s_cut u_theta = ', u_theta
+         else if (s .lt. s_max) then
+            func = cos(kr*(s - s_cut_off))
+            u_theta = u_theta*func
+            ! print *, ' s>s_cut: s = ', s, ' u_theta = ', u_theta, ' func = ', func
+            ! print *, ' arg/pi = ', kr*(s - s_cut_off)/pi
+         else
+            u_theta = 0.0d0
+            ! print *, ' s>s_max: s = ', s, ' u_theta = ', u_theta
+         end if
+
+         ! Test of solid body rotation.
+         ! u_theta = s ! debug
+
+         ux = -u_theta * sin(theta)
+         uy =  u_theta * cos(theta)
+
+         ur   =  ux*cos(phi) + uy*sin(phi)
+         uphi = -ux*sin(phi) + uy*cos(phi)
+
+         Sigma = q(ir, iphi, iz, irho)
+         q(ir, iphi, iz, rmom) = q(ir, iphi, iz, rmom) +  Sigma*ur
+         q(ir, iphi, iz, amom) = q(ir, iphi, iz, amom) +  Sigma*uphi*r         
+      end do
+   end do
+end do
+
+end subroutine add_vortex
+
+!----------------------------------------------------------------------------------85
+
+
+
+
+
+
+
+

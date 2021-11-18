@@ -1,0 +1,32 @@
+#!/bin/tcsh
+#PBS -q normal
+#PBS -l select=50:ncpus=20:model=ivy -lwalltime=4:00:00
+#
+
+# Delete any old files at the beginning of the job.  We want to re-submit
+# only if we have a new files
+\rm return_status.dat
+\rm name_of_last_save_file.dat
+#
+mpiexec -np 1000 pade_mpi
+
+###########################################################
+#  The following code is for automatic restart.  To enable it set the
+#  variable resubmit = 1 and make sure that restart = .true. in the input_file
+#
+set resubmit=0
+# Re-submit
+if ($resubmit == 1) then
+   if ( -e return_status.dat ) then
+      set sv1=`cat return_status.dat`
+      set sv2=`cat name_of_last_save_file.dat`
+      echo "Return status is $sv1"
+      echo "Name of last save file is $sv2"
+      if ($sv1 == 0) then
+         \cp $sv2 mpi_restart
+         qsub pade.pbs
+      endif
+   endif
+endif
+
+
